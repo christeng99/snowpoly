@@ -10,6 +10,8 @@ Only rows with msecs in ``[0, 299_000]`` are stored (5-minute windows; keeps pri
 
 Buffers samples in memory per table; when a coin's market slug/round changes, that coin's buffers are flushed.
 
+Consecutive book updates whose mid price is unchanged at **0.01** precision are not appended, so each table’s history only records price changes at cent resolution.
+
 Run from repo root::
 
     python -m snowpoly.realtime_prices
@@ -89,6 +91,13 @@ Row = Tuple[int, float, float]  # round_ts, msecs, price
 
 # 5-minute Gamma windows are 300_000 ms; persist [0, 299_000] ms from round start.
 MSECS_CAPTURE_MAX = 299_000
+
+# Dedupe sequential mids to 0.01 (Polymarket-style tick).
+_PRICE_TICK_DECIMALS = 2
+
+
+def _same_price_tick(a: float, b: float) -> bool:
+    return round(a, _PRICE_TICK_DECIMALS) == round(b, _PRICE_TICK_DECIMALS)
 
 
 def _msecs_in_capture_window(msecs: float) -> bool:
@@ -261,7 +270,10 @@ class CaptureState:
             if price <= 0:
                 return
             table = self._table(coin, side)
-            self.buffers[table].append((rs, msecs, price))
+            buf = self.buffers[table]
+            if buf and buf[-1][0] == rs and _same_price_tick(buf[-1][2], price):
+                return
+            buf.append((rs, msecs, price))
 
     async def discover_parallel(self) -> Dict[str, Optional[Dict[str, Any]]]:
         def _one(c: str) -> Tuple[str, Optional[Dict[str, Any]]]:
