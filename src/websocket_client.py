@@ -73,19 +73,19 @@ class OrderbookSnapshot:
 
     @property
     def best_ask(self) -> float:
-        """Get best ask price."""
-        return self.asks[0].price if self.asks else 1.0
+        """Get best ask price (0 if no asks)."""
+        return self.asks[0].price if self.asks else 0.0
 
     @property
     def mid_price(self) -> float:
-        """Get mid price."""
-        if self.best_bid > 0 and self.best_ask < 1:
+        """Mid price from top of book; 0 if neither side is meaningful."""
+        if self.best_bid > 0 and self.best_ask > 0:
             return (self.best_bid + self.best_ask) / 2
-        elif self.best_bid > 0:
+        if self.best_bid > 0:
             return self.best_bid
-        elif self.best_ask < 1:
+        if self.best_ask > 0:
             return self.best_ask
-        return 0.5
+        return 0.0
 
     @classmethod
     def from_message(cls, msg: Dict[str, Any]) -> "OrderbookSnapshot":

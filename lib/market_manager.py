@@ -229,12 +229,12 @@ class MarketManager:
     def get_best_ask(self, side: str) -> float:
         """Get best ask price for side."""
         ob = self.get_orderbook(side)
-        return ob.best_ask if ob else 1.0
+        return ob.best_ask if ob else 0.0
 
     def get_spread(self, side: str) -> float:
         """Get spread for side."""
         ob = self.get_orderbook(side)
-        if ob and ob.best_bid > 0:
+        if ob and ob.best_bid > 0 and ob.best_ask > 0:
             return ob.best_ask - ob.best_bid
         return 0.0
 

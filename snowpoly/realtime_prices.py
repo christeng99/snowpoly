@@ -1,16 +1,19 @@
 """
-Real-time Polymarket up/down mid prices for BTC, ETH, SOL, XRP — persisted to SQLite.
+Real-time Polymarket up/down best bid / best ask for BTC, ETH, SOL, XRP — persisted to SQLite.
 
 Database path: ``{DATA_DIR}/prices_{YYYY-MM-DD}.db`` (UTC date; env ``DATA_DIR``, default ``data``).
 
 Tables: btc_up, btc_down, eth_up, eth_down, sol_up, sol_down, xrp_up, xrp_down
-Columns: round_ts (epoch sec, window start from market slug), msecs (ms since that start), price (mid).
+Columns: round_ts (epoch sec, window start from market slug), msecs (ms since that start),
+best_bid, best_ask, mid (same rules as ``OrderbookSnapshot.mid_price``; 0 means empty / no quote).
 
 Only rows with msecs in ``[0, 299_000]`` are stored (5-minute windows; keeps prices aligned with the active round and drops end-of-window edge samples).
 
 Buffers samples in memory per table; when a coin's market slug/round changes, that coin's buffers are flushed.
 
-Consecutive book updates whose mid price is unchanged at **0.01** precision are not appended, so each table’s history only records price changes at cent resolution.
+Consecutive book updates where best_bid, best_ask, and mid are all unchanged at **0.01** precision are not appended.
+
+Existing DBs are migrated: legacy ``price`` becomes bid/ask/mid; older bid/ask-only tables get a ``mid`` column backfilled from the book formula.
 
 Run from repo root::
 
@@ -87,12 +90,12 @@ logger = logging.getLogger("snowpoly.realtime_prices")
 COINS = ("BTC", "ETH", "SOL", "XRP")
 COIN_TABLE_PREFIX = {"BTC": "btc", "ETH": "eth", "SOL": "sol", "XRP": "xrp"}
 
-Row = Tuple[int, float, float]  # round_ts, msecs, price
+Row = Tuple[int, float, float, float, float]  # round_ts, msecs, best_bid, best_ask, mid
 
 # 5-minute Gamma windows are 300_000 ms; persist [0, 299_000] ms from round start.
 MSECS_CAPTURE_MAX = 299_000
 
-# Dedupe sequential mids to 0.01 (Polymarket-style tick).
+# Dedupe sequential bid/ask to 0.01 (Polymarket-style tick).
 _PRICE_TICK_DECIMALS = 2
 
 
@@ -125,6 +128,55 @@ def _db_path_for_utc_today() -> Path:
     return _data_dir() / f"prices_{day}.db"
 
 
+def _table_column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return {str(row[1]) for row in cur.fetchall()}
+
+
+def _rebuild_table_without_legacy_price(conn: sqlite3.Connection, name: str) -> None:
+    """Replace table that still has ``price`` with bid/ask/mid schema; preserve rows."""
+    tmp = f"{name}_migrate_tmp"
+    conn.execute(f"DROP TABLE IF EXISTS {tmp}")
+    conn.execute(
+        f"""
+        CREATE TABLE {tmp} (
+            round_ts INTEGER NOT NULL,
+            msecs REAL NOT NULL,
+            best_bid REAL NOT NULL,
+            best_ask REAL NOT NULL,
+            mid REAL NOT NULL
+        )
+        """
+    )
+    # Mid-only era: copy ``price`` into bid, ask, and mid. Rows with real bid/ask keep legs; mid from ``price``.
+    conn.execute(
+        f"""
+        INSERT INTO {tmp} (round_ts, msecs, best_bid, best_ask, mid)
+        SELECT round_ts, msecs,
+            CASE WHEN best_bid > 0 THEN best_bid ELSE price END,
+            CASE WHEN best_ask > 0 THEN best_ask ELSE price END,
+            price
+        FROM {name}
+        """
+    )
+    conn.execute(f"DROP TABLE {name}")
+    conn.execute(f"ALTER TABLE {tmp} RENAME TO {name}")
+
+
+def _backfill_mid_column(conn: sqlite3.Connection, name: str) -> None:
+    """Set ``mid`` from bid/ask for rows where it was defaulted (migration)."""
+    conn.execute(
+        f"""
+        UPDATE {name} SET mid = CASE
+            WHEN best_bid > 0 AND best_ask > 0 THEN (best_bid + best_ask) / 2
+            WHEN best_bid > 0 THEN best_bid
+            WHEN best_ask > 0 THEN best_ask
+            ELSE 0
+        END
+        """
+    )
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     for coin in COINS:
         prefix = COIN_TABLE_PREFIX[coin]
@@ -135,10 +187,30 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 CREATE TABLE IF NOT EXISTS {name} (
                     round_ts INTEGER NOT NULL,
                     msecs REAL NOT NULL,
-                    price REAL NOT NULL
+                    best_bid REAL NOT NULL,
+                    best_ask REAL NOT NULL,
+                    mid REAL NOT NULL
                 )
                 """
             )
+            cols = _table_column_names(conn, name)
+            if "best_bid" not in cols:
+                conn.execute(
+                    f"ALTER TABLE {name} ADD COLUMN best_bid REAL NOT NULL DEFAULT 0"
+                )
+            if "best_ask" not in cols:
+                conn.execute(
+                    f"ALTER TABLE {name} ADD COLUMN best_ask REAL NOT NULL DEFAULT 0"
+                )
+            cols = _table_column_names(conn, name)
+            if "price" in cols:
+                _rebuild_table_without_legacy_price(conn, name)
+                cols = _table_column_names(conn, name)
+            if "mid" not in cols:
+                conn.execute(
+                    f"ALTER TABLE {name} ADD COLUMN mid REAL NOT NULL DEFAULT 0"
+                )
+                _backfill_mid_column(conn, name)
     conn.commit()
 
 
@@ -147,7 +219,7 @@ def _insert_rows(conn: sqlite3.Connection, table: str, rows: List[Row]) -> None:
     if not rows:
         return
     conn.executemany(
-        f"INSERT INTO {table} (round_ts, msecs, price) VALUES (?, ?, ?)",
+        f"INSERT INTO {table} (round_ts, msecs, best_bid, best_ask, mid) VALUES (?, ?, ?, ?, ?)",
         rows,
     )
 
@@ -266,14 +338,22 @@ class CaptureState:
             msecs = (time.time() - rs) * 1000.0
             if not _msecs_in_capture_window(msecs):
                 return
-            price = snapshot.mid_price
-            if price <= 0:
+            bid = snapshot.best_bid
+            ask = snapshot.best_ask
+            mid = snapshot.mid_price
+            if bid <= 0 and ask <= 0:
                 return
             table = self._table(coin, side)
             buf = self.buffers[table]
-            if buf and buf[-1][0] == rs and _same_price_tick(buf[-1][2], price):
-                return
-            buf.append((rs, msecs, price))
+            if buf and buf[-1][0] == rs:
+                _, _, lb, la, lm = buf[-1]
+                if (
+                    _same_price_tick(lb, bid)
+                    and _same_price_tick(la, ask)
+                    and _same_price_tick(lm, mid)
+                ):
+                    return
+            buf.append((rs, msecs, bid, ask, mid))
 
     async def discover_parallel(self) -> Dict[str, Optional[Dict[str, Any]]]:
         def _one(c: str) -> Tuple[str, Optional[Dict[str, Any]]]:
