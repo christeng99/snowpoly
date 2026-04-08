@@ -11,4 +11,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Configure via env / mounted config at runtime; do not bake secrets into the image.
-CMD ["python", "-m" "snowpoly.realtime_prices"]
+CMD ["python", "-m", "snowpoly.realtime_prices"]
